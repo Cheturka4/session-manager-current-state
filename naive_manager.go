@@ -1,0 +1,281 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// naiveInstance represents one running naive process
+type naiveInstance struct {
+	sni        string
+	appType    AppType
+	configPath string
+	listenAddr string
+	port       int
+	cmd        *exec.Cmd
+	mu         sync.Mutex
+	ready      bool
+	lastUsed   time.Time
+}
+
+// NaiveManager manages a pool of naive proxy processes
+// One process per SNI, spawned on demand, killed after idle timeout
+type NaiveManager struct {
+	naiveBin     string // path to naive binary
+	upstreamURL  string // https://user:pass@proxy.owocloud.online
+	configDir    string // temp dir for per-SNI configs
+	basePort     int    // starting port for naive instances
+
+	mu        sync.Mutex
+	instances map[string]*naiveInstance
+	portNext  int
+}
+
+// naiveConfig matches the JSON format naive expects
+type naiveConfig struct {
+	Listen          string `json:"listen"`
+	Proxy           string `json:"proxy"`
+	RealitySNI      string `json:"reality-sni"`
+	RealityPublicKey string `json:"reality-public-key,omitempty"`
+	Log             string `json:"log"`
+}
+
+func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int) (*NaiveManager, error) {
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, fmt.Errorf("create config dir: %w", err)
+	}
+	return &NaiveManager{
+		naiveBin:    naiveBin,
+		upstreamURL: upstreamURL,
+		configDir:   configDir,
+		basePort:    basePort,
+		instances:   make(map[string]*naiveInstance),
+		portNext:    basePort,
+	}, nil
+}
+
+// GetUpstreamForApp — app-aware версия GetUpstream.
+// AppVideo получает отдельный QUIC-инстанс (quic:// вместо https://).
+func (m *NaiveManager) GetUpstreamForApp(sni string, app AppType) (string, error) {
+	key := sni
+
+	m.mu.Lock()
+	inst, exists := m.instances[key]
+	if !exists {
+		port := m.portNext
+		m.portNext++
+		inst = &naiveInstance{
+			sni:     sni,
+			appType: app,
+			port:    port,
+		}
+		m.instances[key] = inst
+	}
+	m.mu.Unlock()
+
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	inst.lastUsed = time.Now()
+
+	if inst.ready && inst.cmd != nil && inst.cmd.ProcessState == nil {
+		return fmt.Sprintf("127.0.0.1:%d", inst.port), nil
+	}
+
+	if err := m.spawnWithApp(inst); err != nil {
+		return "", fmt.Errorf("spawn naive[%s|%v]: %w", sni, app, err)
+	}
+	return fmt.Sprintf("127.0.0.1:%d", inst.port), nil
+}
+
+// GetUpstreamForAppShard — как GetUpstreamForApp, но создаёт несколько инстансов
+// на один SNI (для IoT/speedtest где нужно много параллельных соединений).
+func (m *NaiveManager) GetUpstreamForAppShard(sni string, app AppType, shard int) (string, error) {
+    key := fmt.Sprintf("%s|shard%d", sni, shard)
+
+    m.mu.Lock()
+    inst, exists := m.instances[key]
+    if !exists {
+        port := m.portNext
+        m.portNext++
+        inst = &naiveInstance{
+            sni:     sni,   // реальный SNI для naive конфига
+            appType: app,
+            port:    port,
+        }
+        m.instances[key] = inst
+    }
+    m.mu.Unlock()
+
+    inst.mu.Lock()
+    defer inst.mu.Unlock()
+
+    inst.lastUsed = time.Now()
+
+    if inst.ready && inst.cmd != nil && inst.cmd.ProcessState == nil {
+        return fmt.Sprintf("127.0.0.1:%d", inst.port), nil
+    }
+
+    if err := m.spawnWithApp(inst); err != nil {
+        return "", fmt.Errorf("spawn naive[%s|shard%d]: %w", sni, shard, err)
+    }
+    return fmt.Sprintf("127.0.0.1:%d", inst.port), nil
+}
+
+func (m *NaiveManager) spawnWithApp(inst *naiveInstance) error {
+	proxyURL := m.upstreamURL
+	// if inst.appType == AppVideo {
+	//	log.Printf("[NaiveMgr] Spawning QUIC instance sni=%s port=%d", inst.sni, inst.port)
+	//} else {
+	//	log.Printf("[NaiveMgr] Spawning HTTP/2 instance sni=%s port=%d", inst.sni, inst.port)
+	//}
+
+	cfgPath := filepath.Join(m.configDir, fmt.Sprintf("naive_%s_%d.json", sanitize(inst.sni), inst.port))
+	listenAddr := fmt.Sprintf("socks://127.0.0.1:%d", inst.port)
+
+	cfg := naiveConfig{
+		Listen:     listenAddr,
+		Proxy:      proxyURL,
+		RealitySNI: inst.sni,
+		Log:        filepath.Join(m.configDir, fmt.Sprintf("naive_%s_%d.log", sanitize(inst.sni), inst.port)),
+	}
+
+	cfgBytes, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
+		return err
+	}
+
+	cmd := exec.Command(m.naiveBin, cfgPath)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+
+	inst.cmd = cmd
+	inst.configPath = cfgPath
+	inst.listenAddr = listenAddr
+	inst.ready = false
+
+	if err := m.waitReady(inst.port, 5*time.Second); err != nil {
+		cmd.Process.Kill()
+		return fmt.Errorf("naive not ready: %w", err)
+	}
+	inst.ready = true
+
+	go func() {
+		cmd.Wait()
+		inst.mu.Lock()
+		inst.ready = false
+		inst.mu.Unlock()
+		log.Printf("[NaiveMgr] naive sni=%s exited", inst.sni)
+	}()
+	return nil
+}
+
+
+// waitReady polls until port is open or timeout
+func (m *NaiveManager) waitReady(port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for port %d", port)
+}
+
+// GCIdleInstances kills naive processes idle for longer than maxIdle
+func (m *NaiveManager) GCIdleInstances(maxIdle time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for sni, inst := range m.instances {
+		inst.mu.Lock()
+		if inst.ready && time.Since(inst.lastUsed) > maxIdle {
+			log.Printf("[NaiveMgr] GC: killing idle naive sni=%s", sni)
+			inst.cmd.Process.Kill()
+			os.Remove(inst.configPath)
+			delete(m.instances, sni)
+		}
+		inst.mu.Unlock()
+	}
+}
+
+// StartGC runs idle instance cleanup on a ticker
+func (m *NaiveManager) StartGC(interval, maxIdle time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			m.GCIdleInstances(maxIdle)
+		}
+	}()
+}
+
+// StopAll kills all running naive instances
+func (m *NaiveManager) StopAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for sni, inst := range m.instances {
+		inst.mu.Lock()
+		if inst.cmd != nil && inst.cmd.Process != nil {
+			inst.cmd.Process.Kill()
+		}
+		os.Remove(inst.configPath)
+		inst.mu.Unlock()
+		log.Printf("[NaiveMgr] stopped naive sni=%s", sni)
+	}
+	m.instances = make(map[string]*naiveInstance)
+}
+
+// Status returns a summary of running instances
+func (m *NaiveManager) Status() []InstanceStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []InstanceStatus
+	for _, inst := range m.instances {
+		inst.mu.Lock()
+		out = append(out, InstanceStatus{
+			SNI:      inst.sni,
+			Port:     inst.port,
+			Ready:    inst.ready,
+			LastUsed: inst.lastUsed,
+		})
+		inst.mu.Unlock()
+	}
+	return out
+}
+
+type InstanceStatus struct {
+	SNI      string
+	Port     int
+	Ready    bool
+	LastUsed time.Time
+}
+
+// sanitize replaces dots with underscores for safe filenames
+func sanitize(s string) string {
+	out := make([]byte, len(s))
+	for i, c := range s {
+		if c == '.' || c == ':' || c == '/' {
+			out[i] = '_'
+		} else {
+			out[i] = byte(c)
+		}
+	}
+	return string(out)
+}
+
