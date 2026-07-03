@@ -440,8 +440,8 @@ func (s *SOCKS5Server) handleUDPAssociate(conn net.Conn) {
 
 func (s *SOCKS5Server) pipe(conn, upstream net.Conn, stats *ConnStats, profile SessionProfile) {
 	done := make(chan struct{}, 2)
-	dlBufSize := 64 * 1024
-	ulBufSize := 64 * 1024
+	dlBufSize := 256 * 1024
+	ulBufSize := 256 * 1024
 	if profile.UploadRatio <= 0.02 {
 		dlBufSize = 256 * 1024
 	}
