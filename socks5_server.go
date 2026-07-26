@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -18,7 +20,13 @@ const (
 	socks5Version = 0x05
 
 	authNone     = 0x00
+	authPassword = 0x02
 	authNoAccept = 0xFF
+
+	// RFC 1929 username/password subnegotiation version byte.
+	userpassVersion = 0x01
+	userpassSuccess = 0x00
+	userpassFailure = 0x01
 
 	cmdConnect      = 0x01
 	cmdUDPAssociate = 0x03
@@ -35,6 +43,11 @@ const (
 	repAddrNotSupported = 0x08
 )
 
+const iotShardCount = 6 // сколько параллельных naive-инстансов держим под
+// speedtest-класс трафика (AppIoT)
+
+var iotShardCounter uint64
+
 // ConnStats tracks per-connection metrics
 type ConnStats struct {
 	BytesUp   int64
@@ -44,6 +57,10 @@ type ConnStats struct {
 // SOCKS5Server is the main proxy server
 type SOCKS5Server struct {
 	listenAddr string
+	// token — общий секрет для RFC1929 username/password авторизации.
+	// Обязателен: пустой token означает "auth отключён" и разрешён
+	// только для локальной отладки на loopback, где это осознанный риск.
+	token      []byte
 	sniPool    *StickyPool
 	naiveMgr   *NaiveManager
 	sessionMgr *SessionManager
@@ -53,9 +70,13 @@ type SOCKS5Server struct {
 	totalConns  int64
 }
 
-func NewSOCKS5Server(listenAddr string, pool *StickyPool, naive *NaiveManager, session *SessionManager) *SOCKS5Server {
+func NewSOCKS5Server(listenAddr string, token []byte, pool *StickyPool, naive *NaiveManager, session *SessionManager) *SOCKS5Server {
+	if len(token) == 0 {
+		log.Printf("[SOCKS5] WARNING: no auth token set — listener on %s accepts ANY local app, including ones excluded from the tunnel. This is the exact bypass class documented in amnezia-vpn/amnezia-client#2452 and #2457.", listenAddr)
+	}
 	return &SOCKS5Server{
 		listenAddr:  listenAddr,
+		token:       token,
 		sniPool:     pool,
 		naiveMgr:    naive,
 		sessionMgr:  session,
@@ -127,7 +148,12 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	log.Printf("[SOCKS5] [%s] app=%s sni=%s profile=min%ds", connID, appType, sni, profile.MinDuration)
 	go s.sessionMgr.preDNS(sni)
 	var upstreamAddr string
-	upstreamAddr, err = s.naiveMgr.GetUpstreamForApp(sni, appType)
+	if appType == AppIoT {
+		shard := int(atomic.AddUint64(&iotShardCounter, 1) % iotShardCount)
+		upstreamAddr, err = s.naiveMgr.GetUpstreamForAppShard(sni, appType, shard)
+	} else {
+		upstreamAddr, err = s.naiveMgr.GetUpstreamForApp(sni, appType)
+	}
 	if err != nil {
 		log.Printf("[SOCKS5] [%s] no upstream for sni=%s: %v", connID, sni, err)
 		s.writeReply(conn, repNetUnreachable, "0.0.0.0", 0)
@@ -148,7 +174,7 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	if err := socks5Connect(upstream, dst, dstPort); err != nil {
+	if err := socks5Connect(upstream, dst, dstPort, s.naiveMgr.token); err != nil {
 		log.Printf("[SOCKS5] [%s] upstream CONNECT error: %v", connID, err)
 		s.writeReply(conn, repNetUnreachable, "0.0.0.0", 0)
 		return
@@ -210,14 +236,68 @@ func (s *SOCKS5Server) handshake(conn net.Conn) error {
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return err
 	}
+
+	// Без токена — старое поведение (только для дев-стендов на loopback).
+	if len(s.token) == 0 {
+		for _, m := range methods {
+			if m == authNone {
+				_, err := conn.Write([]byte{socks5Version, authNone})
+				return err
+			}
+		}
+		conn.Write([]byte{socks5Version, authNoAccept})
+		return fmt.Errorf("no acceptable auth method")
+	}
+
+	// С токеном — требуем RFC1929 username/password, authNone не предлагаем
+	// и не принимаем вообще. Это отсекает любое стороннее приложение,
+	// которое просто открывает 127.0.0.1:port обычным SOCKS5-клиентом
+	// без пароля — ровно тот путь обхода split-tunneling, который описан
+	// в amnezia-vpn/amnezia-client#2452, #2457 и hiddify/hiddify-app#2120.
+	hasPassword := false
 	for _, m := range methods {
-		if m == authNone {
-			_, err := conn.Write([]byte{socks5Version, authNone})
-			return err
+		if m == authPassword {
+			hasPassword = true
+			break
 		}
 	}
-	conn.Write([]byte{socks5Version, authNoAccept})
-	return fmt.Errorf("no acceptable auth method")
+	if !hasPassword {
+		conn.Write([]byte{socks5Version, authNoAccept})
+		return fmt.Errorf("client did not offer username/password auth")
+	}
+	if _, err := conn.Write([]byte{socks5Version, authPassword}); err != nil {
+		return err
+	}
+
+	sub := make([]byte, 2)
+	if _, err := io.ReadFull(conn, sub); err != nil {
+		return err
+	}
+	if sub[0] != userpassVersion {
+		conn.Write([]byte{userpassVersion, userpassFailure})
+		return fmt.Errorf("bad userpass subnegotiation version: %d", sub[0])
+	}
+	uname := make([]byte, int(sub[1]))
+	if _, err := io.ReadFull(conn, uname); err != nil {
+		return err
+	}
+	plenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plenBuf); err != nil {
+		return err
+	}
+	passwd := make([]byte, int(plenBuf[0]))
+	if _, err := io.ReadFull(conn, passwd); err != nil {
+		return err
+	}
+
+	// Константное по времени сравнение — не даём отличить "почти верный"
+	// токен от "совсем неверного" по времени ответа.
+	if subtle.ConstantTimeCompare(passwd, s.token) != 1 {
+		conn.Write([]byte{userpassVersion, userpassFailure})
+		return fmt.Errorf("auth failed for remote %s", conn.RemoteAddr())
+	}
+	_, err := conn.Write([]byte{userpassVersion, userpassSuccess})
+	return err
 }
 
 func (s *SOCKS5Server) readRequest(conn net.Conn) (cmd byte, host string, port uint16, err error) {
@@ -284,22 +364,78 @@ func (s *SOCKS5Server) writeReply(conn net.Conn, rep byte, bindAddr string, bind
 	return err
 }
 
-func socks5Connect(conn net.Conn, host string, port uint16) error {
-	if _, err := conn.Write([]byte{socks5Version, 1, authNone}); err != nil {
-		return err
+// socks5Connect делает исходящий SOCKS5 CONNECT к upstream. Если token не
+// пустой -- проходит RFC1929 username/password (для случаев, когда upstream
+// сам требует auth, как теперь требует наш собственный listenAddr). Если
+// token пустой -- старое поведение (authNone), для внутренних апстримов,
+// которые этой схемой авторизации не пользуются.
+func socks5Connect(conn net.Conn, host string, port uint16, token []byte) error {
+	if len(token) == 0 {
+		if _, err := conn.Write([]byte{socks5Version, 1, authNone}); err != nil {
+			return err
+		}
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			return err
+		}
+		if resp[1] != authNone {
+			return fmt.Errorf("upstream rejected no-auth: %d", resp[1])
+		}
+	} else {
+		if _, err := conn.Write([]byte{socks5Version, 1, authPassword}); err != nil {
+			return err
+		}
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			return err
+		}
+		if resp[1] != authPassword {
+			return fmt.Errorf("upstream did not accept username/password auth: %d", resp[1])
+		}
+		// RFC1929: ver, ulen, uname, plen, passwd. Наши собственные серверы
+		// (SOCKS5Server/RelayServer) username не проверяют, но локальный
+		// naive-инстанс (naive_manager.go: -listen socks://owo:TOKEN@...)
+		// запущен настоящим Chromium SOCKS5-сервером и реально сверяет имя
+		// пользователя -- шлём "owo", а не нулевой байт (было причиной
+		// "upstream auth failed" именно на хопе SessionManager → naive).
+		const naiveSocksUser = "owo"
+		sub := make([]byte, 0, 4+len(naiveSocksUser)+1+len(token))
+		sub = append(sub, userpassVersion, byte(len(naiveSocksUser)))
+		sub = append(sub, naiveSocksUser...)
+		sub = append(sub, byte(len(token)))
+		sub = append(sub, token...)
+		if _, err := conn.Write(sub); err != nil {
+			return err
+		}
+		subResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, subResp); err != nil {
+			return err
+		}
+		if subResp[1] != userpassSuccess {
+			return fmt.Errorf("upstream auth failed")
+		}
 	}
-	resp := make([]byte, 2)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return err
+	// host бывает трёх видов: IPv6-литерал в скобках (readRequest их сама
+	// добавляет для atypIPv6), IPv4-литерал без скобок, или настоящий домен.
+	// Раньше все три кодировались как atypDomain -- для IP-литералов это
+	// ломало origin на стороне naive (двойные скобки после его собственной
+	// канонизации, см. чат: "invalid origin [[...]]").
+	var req []byte
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		if ip := net.ParseIP(host[1 : len(host)-1]); ip != nil {
+			ip16 := ip.To16()
+			req = append(req, socks5Version, cmdConnect, 0x00, atypIPv6)
+			req = append(req, ip16...)
+		}
+	} else if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		req = append(req, socks5Version, cmdConnect, 0x00, atypIPv4)
+		req = append(req, ip.To4()...)
 	}
-	if resp[1] != authNone {
-		return fmt.Errorf("upstream rejected no-auth: %d", resp[1])
+	if req == nil {
+		hostBytes := []byte(host)
+		req = append(req, socks5Version, cmdConnect, 0x00, atypDomain, byte(len(hostBytes)))
+		req = append(req, hostBytes...)
 	}
-	hostBytes := []byte(host)
-	req := make([]byte, 0, 7+len(hostBytes))
-	req = append(req, socks5Version, cmdConnect, 0x00, atypDomain)
-	req = append(req, byte(len(hostBytes)))
-	req = append(req, hostBytes...)
 	req = append(req, byte(port>>8), byte(port))
 	if _, err := conn.Write(req); err != nil {
 		return err

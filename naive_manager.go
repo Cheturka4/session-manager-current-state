@@ -32,6 +32,13 @@ type NaiveManager struct {
 	upstreamURL  string // https://user:pass@proxy.owocloud.online
 	configDir    string // temp dir for per-SNI configs
 	basePort     int    // starting port for naive instances
+	// token -- тот же общий секрет, что у SOCKS5Server/RelayServer. naive
+	// умеет требовать RFC1929 auth на собственном --listen нативно (см.
+	// naive_config.cc: GURL.username()/.password()) -- просто раньше мы
+	// никогда не передавали туда учётные данные, и каждый из портов
+	// 11000+ был точно такой же открытой дверью, как 1080/1081 были
+	// раньше.
+	token        []byte
 
 	mu        sync.Mutex
 	instances map[string]*naiveInstance
@@ -47,7 +54,7 @@ type naiveConfig struct {
 	Log             string `json:"log"`
 }
 
-func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int) (*NaiveManager, error) {
+func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int, token []byte) (*NaiveManager, error) {
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return nil, fmt.Errorf("create config dir: %w", err)
 	}
@@ -56,6 +63,7 @@ func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int) (*Na
 		upstreamURL: upstreamURL,
 		configDir:   configDir,
 		basePort:    basePort,
+		token:       token,
 		instances:   make(map[string]*naiveInstance),
 		portNext:    basePort,
 	}, nil
@@ -138,7 +146,14 @@ func (m *NaiveManager) spawnWithApp(inst *naiveInstance) error {
 	//}
 
 	cfgPath := filepath.Join(m.configDir, fmt.Sprintf("naive_%s_%d.json", sanitize(inst.sni), inst.port))
-	listenAddr := fmt.Sprintf("socks://127.0.0.1:%d", inst.port)
+	// Токен уже hex (encoding/hex.EncodeToString) -- только [0-9a-f], так что
+	// в URL user-info безопасен без дополнительного экранирования.
+	var listenAddr string
+	if len(m.token) == 0 {
+		listenAddr = fmt.Sprintf("socks://127.0.0.1:%d", inst.port)
+	} else {
+		listenAddr = fmt.Sprintf("socks://owo:%s@127.0.0.1:%d", string(m.token), inst.port)
+	}
 
 	cfg := naiveConfig{
 		Listen:     listenAddr,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,10 @@ import (
 type RelayServer struct {
 	listenAddr  string // где слушаем входящие, e.g. "127.0.0.1:1081"
 	socks5Addr  string // Session Manager SOCKS5, e.g. "127.0.0.1:1080"
+	// token -- тот же секрет, что и у основного SOCKS5Server. Без него этот
+	// листенер был чистым обходом токена на 1080: кто угодно мог подключиться
+	// сюда вместо 1080 и получить полный доступ без единого байта авторизации.
+	token       []byte
 	vkClient    *VKClient
 
 	mu          sync.Mutex
@@ -28,10 +33,11 @@ type RelayServer struct {
 	totalServed int64
 }
 
-func NewRelayServer(listenAddr, socks5Addr string, vk *VKClient) *RelayServer {
+func NewRelayServer(listenAddr, socks5Addr string, token []byte, vk *VKClient) *RelayServer {
 	return &RelayServer{
 		listenAddr: listenAddr,
 		socks5Addr: socks5Addr,
+		token:      token,
 		vkClient:   vk,
 	}
 }
@@ -65,7 +71,11 @@ func (r *RelayServer) handleConn(clientConn net.Conn) {
 	clientConn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	// ── SOCKS5 handshake с входящим клиентом ─────────────────────────────────
-	// Caddy уже терминировал TLS и говорит с нами plain SOCKS5
+	// Caddy уже терминировал TLS и говорит с нами plain SOCKS5.
+	// [OwO fix] Раньше здесь безусловно принимался authNone -- то есть
+	// ЛЮБОЙ, кто достанет до этого порта напрямую (минуя Caddy), получал
+	// полный доступ в обход токена, который мы только что поставили на 1080.
+	// Теперь требуем тот же токен и здесь.
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(clientConn, header); err != nil {
 		return
@@ -78,9 +88,50 @@ func (r *RelayServer) handleConn(clientConn net.Conn) {
 	if _, err := io.ReadFull(clientConn, methods); err != nil {
 		return
 	}
-	// Принимаем только no-auth
-	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
-		return
+	if len(r.token) == 0 {
+		clientConn.Write([]byte{0x05, 0x00})
+	} else {
+		hasPassword := false
+		for _, m := range methods {
+			if m == authPassword {
+				hasPassword = true
+				break
+			}
+		}
+		if !hasPassword {
+			clientConn.Write([]byte{0x05, authNoAccept})
+			log.Printf("[Relay] %s: client did not offer username/password auth", clientConn.RemoteAddr())
+			return
+		}
+		if _, err := clientConn.Write([]byte{0x05, authPassword}); err != nil {
+			return
+		}
+		sub := make([]byte, 2)
+		if _, err := io.ReadFull(clientConn, sub); err != nil {
+			return
+		}
+		if sub[0] != userpassVersion {
+			clientConn.Write([]byte{userpassVersion, userpassFailure})
+			return
+		}
+		uname := make([]byte, int(sub[1]))
+		if _, err := io.ReadFull(clientConn, uname); err != nil {
+			return
+		}
+		plenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(clientConn, plenBuf); err != nil {
+			return
+		}
+		passwd := make([]byte, int(plenBuf[0]))
+		if _, err := io.ReadFull(clientConn, passwd); err != nil {
+			return
+		}
+		if subtle.ConstantTimeCompare(passwd, r.token) != 1 {
+			clientConn.Write([]byte{userpassVersion, userpassFailure})
+			log.Printf("[Relay] auth failed for remote %s", clientConn.RemoteAddr())
+			return
+		}
+		clientConn.Write([]byte{userpassVersion, userpassSuccess})
 	}
 
 	// ── Читаем CONNECT запрос ─────────────────────────────────────────────────
@@ -140,7 +191,7 @@ func (r *RelayServer) handleConn(clientConn net.Conn) {
 	defer upstream.Close()
 
 	// SOCKS5 CONNECT через Session Manager (функция из socks5_server.go)
-	if err := socks5Connect(upstream, destHost, destPort); err != nil {
+	if err := socks5Connect(upstream, destHost, destPort, r.token); err != nil {
 		log.Printf("[Relay] Session Manager CONNECT %s:%d failed: %v", destHost, destPort, err)
 		clientConn.Write(relayErrReply(0x04)) // HOST_UNREACHABLE
 		return

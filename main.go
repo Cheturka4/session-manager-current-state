@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -17,6 +21,10 @@ func main() {
 	upstream   := flag.String("upstream", "", "Upstream proxy URL (https://user:pass@host)")
 	configDir  := flag.String("cfgdir", "/tmp/owo-naive-cfgs", "Directory for per-SNI naive configs")
 	basePort   := flag.Int("baseport", 11000, "Starting port for naive instances")
+	socks5Token := flag.String("socks5-token", "", "Shared RFC1929 password for the local SOCKS5 listener. "+
+		"MUST match whatever the TUN client on this device is configured with. "+
+		"If empty, a random token is generated and printed once at startup — "+
+		"copy it into the client config before this process is trusted.")
 
 	// ── Флаги Relay режима ────────────────────────────────────────────────────
 	relay        := flag.Bool("relay", false, "Enable relay mode: accept incoming client connections")
@@ -39,11 +47,38 @@ func main() {
 	log.Printf("[main] OwOCloak Session Manager starting")
 	log.Printf("[main] listen=%s naive=%s relay=%v", *listenAddr, *naiveBin, *relay)
 
+	// ── Токен локального SOCKS5-листенера ────────────────────────────────────
+	// Закрывает обход split-tunneling через localhost (см. socks5_server.go).
+	// [OwO fix] Раньше эта секция писала сырой токен в log.Printf -- это плохая
+	// практика независимо от того, что обычные приложения на Android не могут
+	// читать чужой logcat: логи часто утекают куда-то ещё (crash-репортеры,
+	// удалённый сбор логов для отладки), и лишняя точка утечки не нужна.
+	// Теперь: токен пишется в файл с правами 0600 (владелец — только процесс
+	// session-manager), в лог попадает только короткий необратимый отпечаток
+	// для подтверждения "какой именно токен сейчас активен", не сам секрет.
+	token := []byte(*socks5Token)
+	if len(token) == 0 {
+		raw := make([]byte, 16)
+		if _, err := rand.Read(raw); err != nil {
+			log.Fatalf("[main] failed to generate socks5 token: %v", err)
+		}
+		token = []byte(hex.EncodeToString(raw))
+		tokenPath := filepath.Join(*configDir, "socks5.token")
+		if err := os.MkdirAll(*configDir, 0700); err != nil {
+			log.Fatalf("[main] failed to create %s: %v", *configDir, err)
+		}
+		if err := os.WriteFile(tokenPath, token, 0600); err != nil {
+			log.Fatalf("[main] failed to write %s: %v", tokenPath, err)
+		}
+		fp := sha256.Sum256(token)
+		log.Printf("[main] generated new SOCKS5 token, written to %s (mode 0600). fingerprint=%s (this is NOT the token itself)", tokenPath, hex.EncodeToString(fp[:4]))
+	}
+
 	// ── Инициализация компонентов ─────────────────────────────────────────────
 	pool       := NewStickyPool(defaultPool)
 	sessionMgr := NewSessionManager()
 
-	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort)
+	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort, token)
 	if err != nil {
 		log.Fatalf("[main] NaiveManager init: %v", err)
 	}
@@ -59,26 +94,11 @@ func main() {
 
 	naiveMgr.StartGC(2*time.Minute, 5*time.Minute)
 
-	// ── Cloudflare Top1000 updater ────────────────────────────────────────────
-	go func() {
-		if err := fetchCloudflareTop1000(); err != nil {
-			log.Printf("[cloudflare] initial fetch error: %v", err)
-		} else {
-			log.Printf("[cloudflare] domains updated")
-		}
-		t := time.NewTicker(7 * 24 * time.Hour)
-		defer t.Stop()
-		for range t.C {
-			if err := fetchCloudflareTop1000(); err != nil {
-				log.Printf("[cloudflare] update error: %v", err)
-			} else {
-				log.Printf("[cloudflare] domains refreshed")
-			}
-		}
-	}()
+	// ── Cloudflare Radar updater (по регионам, см. cloudflare_updater.go) ────
+	StartCloudflareUpdater()
 
 	// ── SOCKS5 сервер ─────────────────────────────────────────────────────────
-	server := NewSOCKS5Server(*listenAddr, pool, naiveMgr, sessionMgr)
+	server := NewSOCKS5Server(*listenAddr, token, pool, naiveMgr, sessionMgr)
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("[main] SOCKS5: %v", err)
@@ -115,7 +135,7 @@ func main() {
 		vkc.StartPingLoop(ctx)
 
 		// Relay SOCKS5 сервер
-		relaySrv := NewRelayServer(*relayListen, *listenAddr, vkc)
+		relaySrv := NewRelayServer(*relayListen, *listenAddr, token, vkc)
 		go func() {
 			if err := relaySrv.ListenAndServe(); err != nil {
 				log.Fatalf("[relay] %v", err)
