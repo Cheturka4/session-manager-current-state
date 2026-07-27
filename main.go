@@ -25,6 +25,11 @@ func main() {
 		"MUST match whatever the TUN client on this device is configured with. "+
 		"If empty, a random token is generated and printed once at startup — "+
 		"copy it into the client config before this process is trusted.")
+	signalPassword := flag.String("signal-password", "", "Per-user password for the owo_signal ClientHello "+
+		"signal. Must match (in plaintext -- the dispatcher's secrets.json stores the hex-encoded form of "+
+		"the SAME password) an entry known to the owo-dispatcher on the server side. Empty means naive "+
+		"won't embed any signal, and the dispatcher will always treat this client as unauthenticated "+
+		"(splice to the real decoy site instead of forward_proxy).")
 
 	// ── Флаги Relay режима ────────────────────────────────────────────────────
 	relay        := flag.Bool("relay", false, "Enable relay mode: accept incoming client connections")
@@ -78,7 +83,7 @@ func main() {
 	pool       := NewStickyPool(defaultPool)
 	sessionMgr := NewSessionManager()
 
-	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort, token)
+	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort, token, []byte(*signalPassword))
 	if err != nil {
 		log.Fatalf("[main] NaiveManager init: %v", err)
 	}
