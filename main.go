@@ -30,6 +30,10 @@ func main() {
 		"the SAME password) an entry known to the owo-dispatcher on the server side. Empty means naive "+
 		"won't embed any signal, and the dispatcher will always treat this client as unauthenticated "+
 		"(splice to the real decoy site instead of forward_proxy).")
+	directDomainsFile := flag.String("direct-domains-file", "", "Optional path to a text file "+
+		"(one domain per line, # for comments) of ADDITIONAL bypass domains from the client's "+
+		"split-tunneling rules. Purely additive to sensitiveDirectDomains -- never replaces or "+
+		"disables the hardcoded bank/gov safety list, see domains_direct.go.")
 
 	// ── Флаги Relay режима ────────────────────────────────────────────────────
 	relay        := flag.Bool("relay", false, "Enable relay mode: accept incoming client connections")
@@ -43,6 +47,10 @@ func main() {
 	vkKey        := flag.String("vk-key", "", "Shared HMAC key matching bot SHARED_KEY")
 
 	flag.Parse()
+
+	if err := LoadAdditionalDirectDomains(*directDomainsFile); err != nil {
+		log.Fatalf("[main] --direct-domains-file: %v", err)
+	}
 
 	if *upstream == "" {
 		log.Fatal("[main] --upstream required: https://owo:pass@proxy.owocloud.online")
